@@ -1,0 +1,24 @@
+{
+  "name": "subscription-app",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "db:push": "psql $DATABASE_URL -f sql/001_schema.sql && psql $DATABASE_URL -f sql/002_seed.sql"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "pg": "8.12.0",
+    "cookie": "0.6.0"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "20.14.10",
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0"
+  }
+}
