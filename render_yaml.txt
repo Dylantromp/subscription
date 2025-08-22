@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: subscription-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: API_KEY
+        generateValue: true
+    autoDeploy: false
+
+databases:
+  - name: subscription-db
+    databaseName: subscriptions
+    user: subscription_user
+    plan: free
