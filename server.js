@@ -211,17 +211,18 @@ app.post('/api/clients', authenticateAPI, async (req, res) => {
     
     const clientId = generateId();
     
-    const result = await dbRun(
-      'INSERT INTO clients (client_id, email, name) VALUES ($1, $2, $3)',
-      [clientId, email, name]
-    );
+    const query = isProduction 
+      ? 'INSERT INTO clients (client_id, email, name) VALUES ($1, $2, $3)'
+      : 'INSERT INTO clients (client_id, email, name) VALUES (?, ?, ?)';
+    
+    const result = await dbRun(query, [clientId, email, name]);
     
     res.status(201).json({
       message: 'Client created successfully',
       client: { client_id: clientId, email, name }
     });
   } catch (err) {
-    if (err.message && err.message.includes('UNIQUE')) {
+    if (err.message && (err.message.includes('UNIQUE') || err.message.includes('unique'))) {
       return res.status(400).json({ error: 'Client with this email already exists' });
     }
     console.error('Create client error:', err);
@@ -244,19 +245,29 @@ app.post('/api/subscriptions', authenticateAPI, async (req, res) => {
     const nextBillingDate = new Date(endDate);
     
     // First check if client exists
-    const client = await dbGet('SELECT client_id FROM clients WHERE client_id = $1', [client_id]);
+    const clientQuery = isProduction 
+      ? 'SELECT client_id FROM clients WHERE client_id = $1' 
+      : 'SELECT client_id FROM clients WHERE client_id = ?';
+    
+    const client = await dbGet(clientQuery, [client_id]);
     
     if (!client) {
       return res.status(404).json({ error: 'Client not found' });
     }
     
     // Create subscription
-    await dbRun(
-      `INSERT INTO subscriptions 
-       (subscription_id, client_id, plan_name, price, billing_cycle, end_date, next_billing_date) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [subscriptionId, client_id, plan_name, price, billing_cycle, endDate.toISOString(), nextBillingDate.toISOString()]
-    );
+    const subscriptionQuery = isProduction
+      ? `INSERT INTO subscriptions 
+         (subscription_id, client_id, plan_name, price, billing_cycle, end_date, next_billing_date) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`
+      : `INSERT INTO subscriptions 
+         (subscription_id, client_id, plan_name, price, billing_cycle, end_date, next_billing_date) 
+         VALUES (?, ?, ?, ?, ?, ?, ?)`;
+    
+    await dbRun(subscriptionQuery, [
+      subscriptionId, client_id, plan_name, price, billing_cycle, 
+      endDate.toISOString(), nextBillingDate.toISOString()
+    ]);
     
     res.status(201).json({
       message: 'Subscription created successfully',
@@ -278,185 +289,177 @@ app.post('/api/subscriptions', authenticateAPI, async (req, res) => {
 });
 
 // Check subscription status (main API endpoint)
-app.get('/api/subscriptions/:client_id/status', (req, res) => {
-  const { client_id } = req.params;
-  
-  db.get(
-    `SELECT s.*, c.email, c.name 
-     FROM subscriptions s 
-     JOIN clients c ON s.client_id = c.client_id 
-     WHERE s.client_id = ? AND s.status = 'active'
-     ORDER BY s.created_at DESC LIMIT 1`,
-    [client_id],
-    (err, subscription) => {
-      if (err) {
-        return res.status(500).json({ error: 'Database error' });
-      }
-      
-      if (!subscription) {
-        return res.json({
-          valid: false,
-          message: 'No active subscription found'
-        });
-      }
-      
-      const now = new Date();
-      const endDate = new Date(subscription.end_date);
-      const isValid = now <= endDate && subscription.status === 'active';
-      
-      res.json({
-        valid: isValid,
-        subscription: {
-          subscription_id: subscription.subscription_id,
-          client_id: subscription.client_id,
-          client_name: subscription.name,
-          client_email: subscription.email,
-          plan_name: subscription.plan_name,
-          status: subscription.status,
-          end_date: subscription.end_date,
-          next_billing_date: subscription.next_billing_date,
-          days_remaining: isValid ? Math.ceil((endDate - now) / (1000 * 60 * 60 * 24)) : 0
-        }
+app.get('/api/subscriptions/:client_id/status', async (req, res) => {
+  try {
+    const { client_id } = req.params;
+    
+    const query = `SELECT s.*, c.email, c.name 
+                   FROM subscriptions s 
+                   JOIN clients c ON s.client_id = c.client_id 
+                   WHERE s.client_id = ${isProduction ? '$1' : '?'} AND s.status = 'active'
+                   ORDER BY s.created_at DESC LIMIT 1`;
+    
+    const subscription = await dbGet(query, [client_id]);
+    
+    if (!subscription) {
+      return res.json({
+        valid: false,
+        message: 'No active subscription found'
       });
     }
-  );
+    
+    const now = new Date();
+    const endDate = new Date(subscription.end_date);
+    const isValid = now <= endDate && subscription.status === 'active';
+    
+    res.json({
+      valid: isValid,
+      subscription: {
+        subscription_id: subscription.subscription_id,
+        client_id: subscription.client_id,
+        client_name: subscription.name,
+        client_email: subscription.email,
+        plan_name: subscription.plan_name,
+        status: subscription.status,
+        end_date: subscription.end_date,
+        next_billing_date: subscription.next_billing_date,
+        days_remaining: isValid ? Math.ceil((endDate - now) / (1000 * 60 * 60 * 24)) : 0
+      }
+    });
+  } catch (err) {
+    console.error('Check subscription status error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // Get all clients
-app.get('/api/clients', authenticateAPI, (req, res) => {
-  db.all(
-    `SELECT c.*, s.subscription_id, s.plan_name, s.status, s.end_date, s.next_billing_date
-     FROM clients c 
-     LEFT JOIN subscriptions s ON c.client_id = s.client_id 
-     WHERE s.status = 'active' OR s.status IS NULL
-     ORDER BY c.created_at DESC`,
-    [],
-    (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: 'Database error' });
-      }
-      
-      res.json({ clients: rows });
-    }
-  );
+app.get('/api/clients', authenticateAPI, async (req, res) => {
+  try {
+    const query = `SELECT c.*, s.subscription_id, s.plan_name, s.status, s.end_date, s.next_billing_date
+                   FROM clients c 
+                   LEFT JOIN subscriptions s ON c.client_id = s.client_id 
+                   WHERE s.status = 'active' OR s.status IS NULL
+                   ORDER BY c.created_at DESC`;
+    
+    const clients = await dbQuery(query, []);
+    
+    res.json({ clients });
+  } catch (err) {
+    console.error('Get clients error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // Get billing history
-app.get('/api/billing-history/:client_id?', authenticateAPI, (req, res) => {
-  const { client_id } = req.params;
-  
-  let query = `
-    SELECT bh.*, c.name, c.email, s.plan_name 
-    FROM billing_history bh
-    JOIN clients c ON bh.client_id = c.client_id
-    JOIN subscriptions s ON bh.subscription_id = s.subscription_id
-  `;
-  
-  let params = [];
-  
-  if (client_id) {
-    query += ' WHERE bh.client_id = ?';
-    params.push(client_id);
-  }
-  
-  query += ' ORDER BY bh.billing_date DESC';
-  
-  db.all(query, params, (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
+app.get('/api/billing-history/:client_id?', authenticateAPI, async (req, res) => {
+  try {
+    const { client_id } = req.params;
+    
+    let query = `
+      SELECT bh.*, c.name, c.email, s.plan_name 
+      FROM billing_history bh
+      JOIN clients c ON bh.client_id = c.client_id
+      JOIN subscriptions s ON bh.subscription_id = s.subscription_id
+    `;
+    
+    let params = [];
+    
+    if (client_id) {
+      query += ` WHERE bh.client_id = ${isProduction ? '$1' : '?'}`;
+      params.push(client_id);
     }
     
-    res.json({ billing_history: rows });
-  });
+    query += ' ORDER BY bh.billing_date DESC';
+    
+    const billingHistory = await dbQuery(query, params);
+    
+    res.json({ billing_history: billingHistory });
+  } catch (err) {
+    console.error('Get billing history error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // Cancel subscription
-app.put('/api/subscriptions/:subscription_id/cancel', authenticateAPI, (req, res) => {
-  const { subscription_id } = req.params;
-  
-  db.run(
-    'UPDATE subscriptions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE subscription_id = ?',
-    ['cancelled', subscription_id],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: 'Failed to cancel subscription' });
-      }
-      
-      if (this.changes === 0) {
-        return res.status(404).json({ error: 'Subscription not found' });
-      }
-      
-      res.json({ message: 'Subscription cancelled successfully' });
+app.put('/api/subscriptions/:subscription_id/cancel', authenticateAPI, async (req, res) => {
+  try {
+    const { subscription_id } = req.params;
+    
+    const result = await dbRun(
+      `UPDATE subscriptions SET status = ${isProduction ? '$1' : '?'}, updated_at = CURRENT_TIMESTAMP WHERE subscription_id = ${isProduction ? '$2' : '?'}`,
+      ['cancelled', subscription_id]
+    );
+    
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Subscription not found' });
     }
-  );
+    
+    res.json({ message: 'Subscription cancelled successfully' });
+  } catch (err) {
+    console.error('Cancel subscription error:', err);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
 });
 
 // Monthly billing process
-const processBilling = () => {
+const processBilling = async () => {
   console.log('Processing monthly billing...');
   
-  const now = new Date();
-  
-  // Find subscriptions due for billing
-  db.all(
-    `SELECT s.*, c.email, c.name 
-     FROM subscriptions s 
-     JOIN clients c ON s.client_id = c.client_id 
-     WHERE s.status = 'active' AND datetime(s.next_billing_date) <= datetime(?)`,
-    [now.toISOString()],
-    (err, subscriptions) => {
-      if (err) {
-        console.error('Billing process error:', err);
-        return;
-      }
+  try {
+    const now = new Date();
+    
+    // Find subscriptions due for billing
+    const query = `SELECT s.*, c.email, c.name 
+                   FROM subscriptions s 
+                   JOIN clients c ON s.client_id = c.client_id 
+                   WHERE s.status = 'active' AND ${isProduction ? 's.next_billing_date <= $1' : 'datetime(s.next_billing_date) <= datetime(?)'}`;
+    
+    const subscriptions = await dbQuery(query, [now.toISOString()]);
+    
+    for (const subscription of subscriptions) {
+      const billingId = generateId();
       
-      subscriptions.forEach(subscription => {
-        const billingId = generateId();
-        
-        // Create billing record
-        db.run(
-          `INSERT INTO billing_history 
-           (billing_id, subscription_id, client_id, amount, status) 
-           VALUES (?, ?, ?, ?, ?)`,
-          [billingId, subscription.subscription_id, subscription.client_id, subscription.price, 'processed'],
-          (err) => {
-            if (err) {
-              console.error('Failed to create billing record:', err);
-              return;
-            }
-            
-            // Update next billing date
-            const nextBilling = addMonths(new Date(subscription.next_billing_date), 
-                                       subscription.billing_cycle === 'yearly' ? 12 : 1);
-            const newEndDate = new Date(nextBilling);
-            
-            db.run(
-              `UPDATE subscriptions 
-               SET next_billing_date = ?, end_date = ?, updated_at = CURRENT_TIMESTAMP 
-               WHERE subscription_id = ?`,
-              [nextBilling.toISOString(), newEndDate.toISOString(), subscription.subscription_id],
-              (err) => {
-                if (err) {
-                  console.error('Failed to update subscription:', err);
-                } else {
-                  console.log(`Billed client ${subscription.name} (${subscription.email}) - $${subscription.price}`);
-                }
-              }
-            );
-          }
-        );
-      });
+      // Create billing record
+      await dbRun(
+        `INSERT INTO billing_history 
+         (billing_id, subscription_id, client_id, amount, status) 
+         VALUES (${isProduction ? '$1, $2, $3, $4, $5' : '?, ?, ?, ?, ?'})`,
+        [billingId, subscription.subscription_id, subscription.client_id, subscription.price, 'processed']
+      );
+      
+      // Update next billing date
+      const nextBilling = addMonths(new Date(subscription.next_billing_date), 
+                                   subscription.billing_cycle === 'yearly' ? 12 : 1);
+      const newEndDate = new Date(nextBilling);
+      
+      await dbRun(
+        `UPDATE subscriptions 
+         SET next_billing_date = ${isProduction ? '$1' : '?'}, end_date = ${isProduction ? '$2' : '?'}, updated_at = CURRENT_TIMESTAMP 
+         WHERE subscription_id = ${isProduction ? '$3' : '?'}`,
+        [nextBilling.toISOString(), newEndDate.toISOString(), subscription.subscription_id]
+      );
+      
+      console.log(`Billed client ${subscription.name} (${subscription.email}) - ${subscription.price}`);
     }
-  );
+    
+    console.log(`Billing completed. Processed ${subscriptions.length} subscriptions.`);
+  } catch (err) {
+    console.error('Billing process error:', err);
+  }
 };
 
 // Schedule monthly billing (runs on the 1st of every month at 9 AM)
 cron.schedule('0 9 1 * *', processBilling);
 
 // Manual trigger for billing (for testing)
-app.post('/api/process-billing', authenticateAPI, (req, res) => {
-  processBilling();
-  res.json({ message: 'Billing process triggered' });
+app.post('/api/process-billing', authenticateAPI, async (req, res) => {
+  try {
+    await processBilling();
+    res.json({ message: 'Billing process triggered successfully' });
+  } catch (err) {
+    console.error('Manual billing trigger error:', err);
+    res.status(500).json({ error: 'Failed to process billing' });
+  }
 });
 
 // Health check
